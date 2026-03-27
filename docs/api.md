@@ -46,7 +46,7 @@
 - 方法：`GET`
 - 路由：`/tl/get_smelters`
 - 传入：无
-- 输出：冶炼厂id、冶炼厂
+- 输出：冶炼厂id、冶炼厂名
 - 数据来源：`dict_factories` 表（`is_active=1`）
 - 模拟返回JSON：
 ```json
@@ -161,8 +161,8 @@ file: [图片文件1, 图片文件2]
 - 逻辑说明：
   1. 前端根据接口5返回结果确认/修正后调用此接口
   2. `冶炼厂id` 为 null 时：按名称查 `dict_factories`，存在则复用，不存在则自动新建
-  3. `品类id` 为 null 时：按名称查 `dict_categories`，存在则复用，不存在则自动新建（生成新 `category_id`）
-  4. 以 `(报价日期, 冶炼厂id, 品类id)` 为唯一键写入 `quote_details`，已存在则更新价格
+  3. `品类id` 为 null 时：按名称查 `dict_categories.row_id`，存在则复用，不存在则自动新建
+  4. 以 `(报价日期, 冶炼厂id, 品类row_id)` 为唯一键写入 `quote_details`，已存在则更新价格
 - 模拟请求JSON：
 ```json
 {
@@ -255,7 +255,187 @@ file: [图片文件1, 图片文件2]
 
 ---
 
+## 接口A7：采购建议
+- 方法：`POST`
+- 路由：`/tl/get_purchase_suggestion`
+- 传入：仓库id列表、需求列表（冶炼厂id、品类id、需求吨数）
+- 输出：LLM生成的各仓库发车意见 + 原始结构化数据
+- 逻辑说明：
+  1. 查询各(仓库,冶炼厂)最新运费、各(冶炼厂,品类)最新报价
+  2. 计算综合成本（报价+运费），整理结构化数据
+  3. 将数据交由大语言模型分析，要求：同仓库货物混装、尽量整车（20-30吨）、优先低成本方案
+  4. 返回 LLM 生成的各仓库发车意见表文字 + 原始数据列表
+- 模拟请求JSON：
+```json
+{
+  "warehouse_ids": [101, 102],
+  "demands": [
+    { "smelter_id": 201, "category_id": 301, "demand": 5.0 },
+    { "smelter_id": 202, "category_id": 301, "demand": 3.0 }
+  ]
+}
+```
+- 模拟返回JSON：
+```json
+{
+  "code": 200,
+  "data": {
+    "suggestion": "## 各仓库发车意见表\n\n**北京仓**\n| 装车方案 | 品类 | 吨数 | 目的冶炼厂 | 综合成本 | 备注 |\n...",
+    "raw": [
+      { "仓库": "北京仓", "冶炼厂": "华北冶炼厂", "品类": "铜", "需求吨数": 5.0, "报价(元/吨)": 9350, "运费(元/吨)": 200, "综合成本(元/吨)": 9550 }
+    ]
+  }
+}
+```
+
+---
+
+# 用户认证模块 — 接口文档
+
+---
+
+## 接口A1：登录
+- 方法：`POST`
+- 路由：`/auth/login`
+- 传入：username、password
+- 输出：JWT token、用户信息
+- 逻辑说明：校验账号密码，成功返回 JWT token 及用户基本信息；失败返回 401
+
+---
+
+## 接口A0：注册
+- 方法：`POST`
+- 路由：`/auth/register`
+- 传入：username、real_name、password、phone（可选）
+- 输出：新建用户id
+- 逻辑说明：账号唯一，重复则返回 400；新用户默认角色为 `user`；密码后端加盐存储
+- 模拟请求JSON：
+```json
+{ "username": "user2", "real_name": "张三", "password": "123456", "phone": "13800138003" }
+```
+- 模拟返回JSON（成功）：
+```json
+{ "code": 200, "msg": "注册成功", "id": 3 }
+```
+- 模拟返回JSON（账号重复）：
+```json
+{ "code": 400, "msg": "账号已存在" }
+```
+- 模拟请求JSON：
+```json
+{ "username": "admin", "password": "123456" }
+```
+- 模拟返回JSON（成功）：
+```json
+{
+  "code": 200,
+  "msg": "登录成功",
+  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "user": { "id": 1, "username": "admin", "real_name": "管理员", "role": "admin", "phone": "13800138001", "email": "admin@example.com" }
+}
+```
+- 模拟返回JSON（失败）：
+```json
+{ "detail": "账号或密码错误" }
+```
+
+---
+
+## 接口A2：获取用户列表
+- 方法：`GET`
+- 路由：`/auth/users`
+- 权限：仅 admin
+- 传入（Query参数）：keyword（可选，账号/姓名/手机模糊搜索）、role（可选，`admin`/`user`）、page（默认1）、page_size（默认10）
+- 输出：用户列表、总条数
+- 请求头：`Authorization: Bearer <token>`
+- 模拟返回JSON：
+```json
+{
+  "code": 200,
+  "data": {
+    "total": 1,
+    "list": [
+      { "id": 1, "username": "admin", "real_name": "管理员", "role": "admin", "phone": "13800138001", "email": "admin@example.com" }
+    ]
+  }
+}
+```
+
+---
+
+## 接口A3：新增用户
+- 方法：`POST`
+- 路由：`/auth/users`
+- 权限：仅 admin
+- 传入：username、password、real_name（可选）、role（admin/user，默认user）、phone（可选）、email（可选）
+- 输出：新建用户id
+- 请求头：`Authorization: Bearer <token>`
+- 模拟请求JSON：
+```json
+{ "username": "user2", "real_name": "张三", "password": "123456", "role": "user", "phone": "13800138003", "email": "zhangsan@example.com" }
+```
+- 模拟返回JSON：
+```json
+{ "code": 200, "msg": "用户创建成功", "id": 3 }
+```
+
+---
+
+## 接口A4：修改用户角色
+- 方法：`POST`
+- 路由：`/auth/update_role`
+- 权限：仅 admin
+- 传入：id（用户id）、role（新角色）
+- 请求头：`Authorization: Bearer <token>`
+- 模拟请求JSON：
+```json
+{ "id": 2, "role": "admin" }
+```
+- 模拟返回JSON：
+```json
+{ "code": 200, "msg": "角色修改成功" }
+```
+
+---
+
+## 接口A5：修改用户密码
+- 方法：`POST`
+- 路由：`/auth/change_password`
+- 传入：id（用户id）、admin_key（服务端配置的固定密钥）、new_password
+- 逻辑说明：校验 admin_key 与服务端 `JWT_SECRET_KEY` 一致后更新密码
+- 模拟请求JSON：
+```json
+{ "id": 2, "admin_key": "your-secret-key", "new_password": "newpass123" }
+```
+- 模拟返回JSON：
+```json
+{ "code": 200, "msg": "密码修改成功" }
+```
+
+---
+
+## 接口A6：删除用户
+- 方法：`POST`
+- 路由：`/auth/delete_user`
+- 权限：仅 admin，且不可删除自己
+- 传入：id（用户id）
+- 逻辑说明：软删除，将 `is_active` 置0
+- 请求头：`Authorization: Bearer <token>`
+- 模拟请求JSON：
+```json
+{ "id": 3 }
+```
+- 模拟返回JSON：
+```json
+{ "code": 200, "msg": "用户已删除" }
+```
+
+---
+
 ## 补充说明
-1. 所有JSON中的 `code: 200` 为通用成功状态码，无额外业务含义
-2. 错误状态码：`400`（参数校验失败）、`404`（仓库/冶炼厂不存在）、`500`（服务器内部错误）
-3. 数据库连接使用 `autocommit=True`，写操作自动提交
+1. 所有JSON中的 `code: 200` 为通用成功状态码
+2. 需登录的接口请求头须携带 `Authorization: Bearer <token>`
+3. token 过期或无效返回 `401`，非 admin 调用管理接口返回 `403`
+4. 错误状态码：`400`（参数校验失败）、`401`（未登录）、`403`（权限不足）、`404`（资源不存在）、`500`（服务器内部错误）
+5. 数据库连接使用 `autocommit=True`，写操作自动提交
+6. LLM 配置通过环境变量注入：`LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`
