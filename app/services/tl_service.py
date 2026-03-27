@@ -522,7 +522,8 @@ class TLService:
     ) -> Dict[str, Any]:
         """
         根据仓库列表和需求（冶炼厂+品类+吨数），查询最新运费和报价，
-        计算综合成本（报价+运费），按品类推荐最优冶炼厂，返回文字建议。
+        整理结构化数据后调用 Claude 生成各仓库发车建议表。
+        同一仓库发出的货物可混装，尽量整车发。
         """
         if not warehouse_ids or not demands:
             raise ValueError("仓库列表和需求不能为空")
@@ -536,6 +537,13 @@ class TLService:
 
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # 仓库名称
+                cur.execute(
+                    f"SELECT id, name FROM dict_warehouses WHERE id IN ({wh_ph})",
+                    tuple(warehouse_ids),
+                )
+                warehouse_name_map: Dict[int, str] = {r[0]: r[1] for r in cur.fetchall()}
+
                 # 品类主名称
                 cur.execute(
                     f"SELECT category_id, "
@@ -554,10 +562,12 @@ class TLService:
                 )
                 factory_name_map: Dict[int, str] = {r[0]: r[1] for r in cur.fetchall()}
 
-                # 最新运费：每个(仓库,冶炼厂)取最新，再取各仓库最小值作为代表运费
+                # 最新运费：每个(仓库, 冶炼厂)取最新日期，保留仓库维度
                 cur.execute(
                     f"""
-                    SELECT df.id AS fid, MIN(fr.price_per_ton) AS min_freight
+                    SELECT dw.id AS wid, dw.name AS wname,
+                           df.id AS fid, df.name AS fname,
+                           fr.price_per_ton
                     FROM freight_rates fr
                     JOIN dict_warehouses dw ON fr.warehouse_id = dw.id
                     JOIN dict_factories  df ON fr.factory_id  = df.id
@@ -569,14 +579,15 @@ class TLService:
                           WHERE fr2.factory_id  = fr.factory_id
                             AND fr2.warehouse_id = fr.warehouse_id
                       )
-                    GROUP BY df.id
                     """,
                     tuple(warehouse_ids) + tuple(smelter_ids),
                 )
-                # freight_map: {factory_id: min_freight}
-                freight_map: Dict[int, float] = {r[0]: float(r[1]) for r in cur.fetchall()}
+                # freight_map: {(warehouse_id, factory_id): freight}
+                freight_map: Dict[tuple, float] = {
+                    (r[0], r[2]): float(r[4]) for r in cur.fetchall()
+                }
 
-                # 最新报价：每个(冶炼厂, category_id分组)取最新
+                # 最新报价：每个(冶炼厂, category_id分组)
                 cur.execute(
                     f"""
                     SELECT qd.factory_id, dc.category_id, qd.unit_price
@@ -593,42 +604,72 @@ class TLService:
                     """,
                     tuple(smelter_ids) + tuple(category_ids),
                 )
-                # price_map: {(factory_id, category_id): unit_price}
                 price_map: Dict[tuple, float] = {
                     (r[0], r[1]): float(r[2]) for r in cur.fetchall()
                 }
 
-        # 按品类分组需求，计算综合成本，生成建议
-        from collections import defaultdict
-        cat_demands: Dict[int, List[Dict]] = defaultdict(list)
+        # 构造结构化数据：每条需求 × 每个仓库，计算综合成本
+        rows = []
         for d in demands:
-            cat_demands[d["category_id"]].append(d)
-
-        suggestion_parts = []
-        for cid, items in cat_demands.items():
+            fid = d["smelter_id"]
+            cid = d["category_id"]
+            fname = factory_name_map.get(fid, f"冶炼厂{fid}")
             cat_name = cat_name_map.get(cid, f"品类{cid}")
-            total_tons = sum(i["demand"] for i in items)
-            detail_parts = []
-            for item in items:
-                fid = item["smelter_id"]
-                fname = factory_name_map.get(fid, f"冶炼厂{fid}")
-                price = price_map.get((fid, cid))
-                freight = freight_map.get(fid)
+            price = price_map.get((fid, cid))
+            demand_tons = d["demand"]
+
+            for wid in warehouse_ids:
+                wname = warehouse_name_map.get(wid, f"仓库{wid}")
+                freight = freight_map.get((wid, fid))
                 if price is not None and freight is not None:
                     total_cost = price + freight
-                    detail_parts.append(
-                        f"从{fname}采购{item['demand']}吨（综合成本{total_cost:.0f}元/吨，报价{price:.0f}+运费{freight:.0f}）"
-                    )
+                    rows.append({
+                        "仓库": wname,
+                        "冶炼厂": fname,
+                        "品类": cat_name,
+                        "需求吨数": demand_tons,
+                        "报价(元/吨)": price,
+                        "运费(元/吨)": freight,
+                        "综合成本(元/吨)": total_cost,
+                    })
                 else:
-                    detail_parts.append(
-                        f"从{fname}采购{item['demand']}吨（暂无完整报价或运费数据）"
-                    )
-            suggestion_parts.append(
-                f"品类「{cat_name}」共需{total_tons}吨：" + "，".join(detail_parts) + "。"
-            )
+                    rows.append({
+                        "仓库": wname,
+                        "冶炼厂": fname,
+                        "品类": cat_name,
+                        "需求吨数": demand_tons,
+                        "报价(元/吨)": price,
+                        "运费(元/吨)": freight,
+                        "综合成本(元/吨)": None,
+                    })
 
-        suggestion = "\n".join(suggestion_parts) if suggestion_parts else "暂无足够数据生成建议。"
-        return {"code": 200, "data": {"suggestion": suggestion}}
+        # 构造 prompt，调用 Claude
+        import json
+        from openai import OpenAI
+        from app import config as app_config
+
+        client = OpenAI(api_key=app_config.LLM_API_KEY, base_url=app_config.LLM_BASE_URL)
+        data_str = json.dumps(rows, ensure_ascii=False, indent=2)
+        prompt = f"""你是一名采购优化顾问。以下是各仓库到各冶炼厂的采购数据（包含需求吨数、报价、运费、综合成本）：
+
+{data_str}
+
+请根据以上数据，给出各仓库的发车安排建议，要求：
+1. 同一仓库发出的不同品类货物可以混装在同一辆车上，提高车辆利用率
+2. 尽量整车发（一般整车约20-30吨），避免零散发货
+3. 综合考虑成本，优先推荐综合成本（报价+运费）更低的方案
+4. 最终输出格式为：**各仓库发车意见表**，包含：仓库名、建议装车方案（品类+吨数+目的冶炼厂）、预计综合成本、发车备注
+5. 如有数据缺失（报价或运费为null），请在备注中说明需补录数据"""
+
+        client = OpenAI(api_key=app_config.LLM_API_KEY, base_url=app_config.LLM_BASE_URL)
+        resp = client.chat.completions.create(
+            model=app_config.LLM_MODEL,
+            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        suggestion = resp.choices[0].message.content
+
+        return {"code": 200, "data": {"suggestion": suggestion, "raw": rows}}
 
 
 # ==================== 单例工厂 ====================

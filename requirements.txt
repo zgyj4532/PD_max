@@ -8,3 +8,4 @@ cryptography
 rapidocr_onnxruntime
 passlib[bcrypt]
 python-jose[cryptography]
+openai

@@ -28,3 +28,8 @@ UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "change_this_to_a_strong_random_secret")
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 JWT_ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))  # 默认 24 小时
+
+# LLM API 配置
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.anthropic.com")
+LLM_MODEL = os.getenv("LLM_MODEL", "claude-sonnet-4-6")
