@@ -8,6 +8,10 @@ class ComparisonRequest(BaseModel):
     选中仓库id列表: List[int] = Field(..., description="选中的仓库ID列表")
     冶炼厂id列表: List[int] = Field(..., description="冶炼厂ID列表")
     品类id列表: List[int] = Field(..., description="品类ID列表")
+    税率类型: Optional[str] = Field(
+        None,
+        description="价格税率类型：null=普通价、1pct=1%增值税、3pct=3%增值税、13pct=13%增值税、normal_invoice=普通发票、reverse_invoice=反向发票"
+    )
 
 
 class AddWarehouseRequest(BaseModel):
@@ -40,7 +44,12 @@ class ConfirmPriceTableItem(BaseModel):
     冶炼厂id: Optional[int] = Field(None, description="冶炼厂ID，null则自动新建")
     品类名: str = Field(..., description="品类名称（OCR识别或前端修改后）")
     品类id: Optional[int] = Field(None, description="品类分组ID，null则自动新建")
-    价格: float = Field(..., description="单价（元/吨）")
+    价格: float = Field(..., description="普通价单价（元/吨）")
+    价格_1pct增值税: Optional[float] = Field(None, description="1%增值税价格（元/吨）")
+    价格_3pct增值税: Optional[float] = Field(None, description="3%增值税价格（元/吨）")
+    价格_13pct增值税: Optional[float] = Field(None, description="13%增值税价格（元/吨）")
+    普通发票价格: Optional[float] = Field(None, description="普通发票价格（元/吨）")
+    反向发票价格: Optional[float] = Field(None, description="反向发票价格（元/吨）")
 
 
 class ConfirmPriceTableRequest(BaseModel):
