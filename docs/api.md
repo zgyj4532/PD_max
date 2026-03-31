@@ -184,9 +184,10 @@ file: [报价单1.jpg]
 - 逻辑说明：
   1. 前端对接口5返回的 `items` 确认/修正后，连同原始 `full_data` 一起提交
   2. `冶炼厂id` 为 null 时：按名称查 `dict_factories`，存在则复用，不存在则自动新建
-  3. `品类id` 为 null 时：按名称查 `dict_categories.row_id`，存在则复用，不存在则自动新建
+  3. 品类处理：按 `品类名` 查 `dict_categories`，存在则复用其 `category_id`，不存在则自动新建（分配新的 `category_id`）
   4. `full_data` 存入 `quote_table_metadata` 表（按 `factory_id + quote_date` 唯一键，已存在则更新）
-  5. 每条明细以 `(报价日期, 冶炼厂id, 品类row_id)` 为唯一键写入 `quote_details`，已存在则更新价格，并关联 `metadata_id`
+  5. 每条明细以 `(报价日期, 冶炼厂id, 品类名)` 为唯一键写入 `quote_details`，已存在则更新价格，并关联 `metadata_id`
+  6. **重要变更**：价格表现在存储品类名称而不是品类ID，这样当品类映射变化时，价格表无需更新
 - 模拟请求JSON：
 ```json
 {

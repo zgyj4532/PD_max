@@ -148,7 +148,7 @@ class TLService:
                     sm_ph = ",".join(["%s"] * len(smelter_ids))
                     cat_ph = ",".join(["%s"] * len(category_ids))
 
-                    # 品类主名称
+                    # 品类主名称（用于展示）
                     cur.execute(
                         f"SELECT DISTINCT category_id, "
                         f"COALESCE(MAX(CASE WHEN is_main=1 THEN name END), MAX(name)) AS cat_name "
@@ -181,19 +181,22 @@ class TLService:
                     for wid, wname, fid, fname, freight in cur.fetchall():
                         freight_map[(wid, fid)] = (wname, fname, freight)
 
-                    # category_id 分组 → row_id 列表
+                    # category_id → 品类名称列表（用于匹配价格表）
                     cur.execute(
-                        f"SELECT row_id, category_id FROM dict_categories "
+                        f"SELECT category_id, name FROM dict_categories "
                         f"WHERE category_id IN ({cat_ph}) AND is_active = 1",
                         tuple(category_ids),
                     )
-                    row_id_to_cat: Dict[int, int] = {row[0]: row[1] for row in cur.fetchall()}
-                    row_ids = list(row_id_to_cat.keys())
+                    cat_id_to_names: Dict[int, List[str]] = {}
+                    for cat_id, name in cur.fetchall():
+                        cat_id_to_names.setdefault(cat_id, []).append(name)
 
-                    if not row_ids:
+                    if not cat_id_to_names:
                         return []
 
-                    ri_ph = ",".join(["%s"] * len(row_ids))
+                    # 所有品类名称（用于查询价格表）
+                    all_cat_names = [name for names in cat_id_to_names.values() for name in names]
+                    cn_ph = ",".join(["%s"] * len(all_cat_names))
 
                     # 税率表：{factory_id: {tax_type: rate}}
                     cur.execute(
@@ -206,34 +209,40 @@ class TLService:
                     for fid, ttype, rate in cur.fetchall():
                         tax_rate_map.setdefault(fid, {})[ttype] = float(rate)
 
-                    # 最新报价（取全部价格列，用于换算回退）
+                    # 最新报价（通过品类名称查询）
                     cur.execute(
                         f"""
-                        SELECT factory_id, category_id,
+                        SELECT factory_id, category_name,
                                unit_price, price_1pct_vat, price_3pct_vat, price_13pct_vat,
                                price_normal_invoice, price_reverse_invoice
                         FROM quote_details
                         WHERE factory_id IN ({sm_ph})
-                          AND category_id IN ({ri_ph})
+                          AND category_name IN ({cn_ph})
                           AND quote_date = (
                               SELECT MAX(qd2.quote_date)
                               FROM quote_details qd2
                               WHERE qd2.factory_id  = quote_details.factory_id
-                                AND qd2.category_id = quote_details.category_id
+                                AND qd2.category_name = quote_details.category_name
                           )
                         """,
-                        tuple(smelter_ids) + tuple(row_ids),
+                        tuple(smelter_ids) + tuple(all_cat_names),
                     )
-                    # raw_price_map: {(factory_id, row_id): {col: value}}
+                    # raw_price_map: {(factory_id, category_name): {col: value}}
                     col_names = ["unit_price", "price_1pct_vat", "price_3pct_vat",
                                  "price_13pct_vat", "price_normal_invoice", "price_reverse_invoice"]
                     raw_price_map: Dict[tuple, Dict[str, Optional[float]]] = {}
+                    name_to_cat_id: Dict[str, int] = {}
                     for row in cur.fetchall():
-                        fid_r, rid = row[0], row[1]
-                        raw_price_map[(fid_r, rid)] = {
+                        fid_r, cat_name = row[0], row[1]
+                        raw_price_map[(fid_r, cat_name)] = {
                             col: (float(v) if v is not None else None)
                             for col, v in zip(col_names, row[2:])
                         }
+                        # 建立品类名称到category_id的映射
+                        for cat_id, names in cat_id_to_names.items():
+                            if cat_name in names:
+                                name_to_cat_id[cat_name] = cat_id
+                                break
 
             # 换算逻辑（纯 Python，连接已关闭）
             # col → tax_type 的对应关系，用于反算不含税价
@@ -243,41 +252,47 @@ class TLService:
                 "price_13pct_vat": "13pct",
             }
 
-            def resolve_price(fid: int, rid: int) -> Tuple[Optional[float], str]:
+            def resolve_price(fid: int, cat_id: int) -> Tuple[Optional[float], str]:
                 """
                 返回 (price, source)
                 source: "direct" | "calc_from_base" | "calc_from_other_vat" | "unavailable"
                 """
-                prices = raw_price_map.get((fid, rid), {})
-                rates = tax_rate_map.get(fid, {})
+                # 找该 category_id 下的所有品类名称，取第一个有报价的
+                cat_names = cat_id_to_names.get(cat_id, [])
+                for cat_name in cat_names:
+                    prices = raw_price_map.get((fid, cat_name), {})
+                    if not prices:
+                        continue
 
-                # 1. 直接有目标列
-                direct = prices.get(target_col)
-                if direct is not None:
-                    return direct, "direct"
+                    rates = tax_rate_map.get(fid, {})
 
-                # 2. 目标是含税价，且有不含税基础价 + 目标税率
-                if target_tax and prices.get("unit_price") is not None and target_tax in rates:
-                    base = prices["unit_price"]
-                    calc = round(base * (1 + rates[target_tax]), 2)
-                    return calc, "calc_from_base"
+                    # 1. 直接有目标列
+                    direct = prices.get(target_col)
+                    if direct is not None:
+                        return direct, "direct"
 
-                # 3. 目标是基础价(unit_price)，从已知含税价反算
-                if target_col == "unit_price":
-                    for col, src_tax in COL_TO_TAX.items():
-                        known_price = prices.get(col)
-                        if known_price is not None and src_tax in rates:
-                            base = round(known_price / (1 + rates[src_tax]), 2)
-                            return base, f"calc_from_{src_tax}"
+                    # 2. 目标是含税价，且有不含税基础价 + 目标税率
+                    if target_tax and prices.get("unit_price") is not None and target_tax in rates:
+                        base = prices["unit_price"]
+                        calc = round(base * (1 + rates[target_tax]), 2)
+                        return calc, "calc_from_base"
 
-                # 4. 从其他已知含税价反算不含税，再正向换算
-                if target_tax and target_tax in rates:
-                    for col, src_tax in COL_TO_TAX.items():
-                        known_price = prices.get(col)
-                        if known_price is not None and src_tax in rates:
-                            base = round(known_price / (1 + rates[src_tax]), 4)
-                            calc = round(base * (1 + rates[target_tax]), 2)
-                            return calc, f"calc_from_{src_tax}"
+                    # 3. 目标是基础价(unit_price)，从已知含税价反算
+                    if target_col == "unit_price":
+                        for col, src_tax in COL_TO_TAX.items():
+                            known_price = prices.get(col)
+                            if known_price is not None and src_tax in rates:
+                                base = round(known_price / (1 + rates[src_tax]), 2)
+                                return base, f"calc_from_{src_tax}"
+
+                    # 4. 从其他已知含税价反算不含税，再正向换算
+                    if target_tax and target_tax in rates:
+                        for col, src_tax in COL_TO_TAX.items():
+                            known_price = prices.get(col)
+                            if known_price is not None and src_tax in rates:
+                                base = round(known_price / (1 + rates[src_tax]), 4)
+                                calc = round(base * (1 + rates[target_tax]), 2)
+                                return calc, f"calc_from_{src_tax}"
 
                 return None, "unavailable"
 
@@ -288,14 +303,7 @@ class TLService:
                     cat_name = cat_map.get(cid)
                     if cat_name is None:
                         continue
-                    # 找该 category_id 下所有 row_id，取第一个有报价的
-                    price, source = None, "unavailable"
-                    for rid, cat in row_id_to_cat.items():
-                        if cat == cid:
-                            p, s = resolve_price(fid, rid)
-                            if p is not None:
-                                price, source = p, s
-                                break
+                    price, source = resolve_price(fid, cid)
 
                     result.append({
                         "仓库": wname,
@@ -570,26 +578,23 @@ class TLService:
                                 )
                                 item["冶炼厂id"] = cur.lastrowid
 
-                        # 2. 品类不存在则新建，item["品类id"] 存的是 row_id
-                        if item.get("品类id") is None:
-                            cat_name = item["品类名"]
+                        # 2. 品类不存在则新建到 dict_categories
+                        cat_name = item["品类名"]
+                        cur.execute(
+                            "SELECT category_id FROM dict_categories WHERE name = %s AND is_active = 1",
+                            (cat_name,),
+                        )
+                        row = cur.fetchone()
+                        if not row:
+                            # 新建品类，分配新的 category_id
+                            cur.execute("SELECT COALESCE(MAX(category_id), 0) + 1 FROM dict_categories")
+                            new_cat_id = cur.fetchone()[0]
                             cur.execute(
-                                "SELECT row_id FROM dict_categories WHERE name = %s AND is_active = 1",
-                                (cat_name,),
+                                "INSERT INTO dict_categories "
+                                "(category_id, name, is_main, is_active) "
+                                "VALUES (%s, %s, 1, 1)",
+                                (new_cat_id, cat_name),
                             )
-                            row = cur.fetchone()
-                            if row:
-                                item["品类id"] = row[0]
-                            else:
-                                cur.execute("SELECT COALESCE(MAX(category_id), 0) + 1 FROM dict_categories")
-                                new_cat_id = cur.fetchone()[0]
-                                cur.execute(
-                                    "INSERT INTO dict_categories "
-                                    "(category_id, name, is_main, is_active) "
-                                    "VALUES (%s, %s, 1, 1)",
-                                    (new_cat_id, cat_name),
-                                )
-                                item["品类id"] = cur.lastrowid
 
                     # 3. 存储全量元数据（如果有 full_data）
                     metadata_id = None
@@ -648,18 +653,17 @@ class TLService:
                                 row = cur.fetchone()
                                 metadata_id = row[0] if row else None
 
-                    # 4. 写入明细，相同(日期+冶炼厂+品类)则更新价格
+                    # 4. 写入明细，相同(日期+冶炼厂+品类名)则更新价格
                     for item in items:
                         cur.execute(
                             """
                             INSERT INTO quote_details
-                            (quote_date, factory_id, category_id, metadata_id, raw_category_name,
+                            (quote_date, factory_id, category_name, metadata_id,
                              unit_price, price_1pct_vat, price_3pct_vat, price_13pct_vat,
                              price_normal_invoice, price_reverse_invoice)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                             ON DUPLICATE KEY UPDATE
                                 metadata_id = VALUES(metadata_id),
-                                raw_category_name = VALUES(raw_category_name),
                                 unit_price = VALUES(unit_price),
                                 price_1pct_vat = VALUES(price_1pct_vat),
                                 price_3pct_vat = VALUES(price_3pct_vat),
@@ -671,9 +675,8 @@ class TLService:
                             (
                                 quote_dt,
                                 item["冶炼厂id"],
-                                item["品类id"],
-                                metadata_id,
                                 item["品类名"],
+                                metadata_id,
                                 item.get("价格"),
                                 item.get("价格_1pct增值税"),
                                 item.get("价格_3pct增值税"),
@@ -925,44 +928,47 @@ class TLService:
                 for fid, ttype, rate in cur.fetchall():
                     tax_rate_map.setdefault(fid, {})[ttype] = float(rate)
 
-                # category_id → row_id 映射
+                # category_id → 品类名称列表
                 cur.execute(
-                    f"SELECT row_id, category_id FROM dict_categories "
+                    f"SELECT category_id, name FROM dict_categories "
                     f"WHERE category_id IN ({cat_ph}) AND is_active = 1",
                     tuple(category_ids),
                 )
-                row_id_to_cat: Dict[int, int] = {row[0]: row[1] for row in cur.fetchall()}
-                row_ids = list(row_id_to_cat.keys())
+                cat_id_to_names: Dict[int, List[str]] = {}
+                for cat_id, name in cur.fetchall():
+                    cat_id_to_names.setdefault(cat_id, []).append(name)
 
-                if not row_ids:
+                if not cat_id_to_names:
                     return {"demand_rows": [], "raw": []}
 
-                ri_ph = ",".join(["%s"] * len(row_ids))
+                # 所有品类名称
+                all_cat_names = [name for names in cat_id_to_names.values() for name in names]
+                cn_ph = ",".join(["%s"] * len(all_cat_names))
 
-                # 最新报价：查询所有价格列
+                # 最新报价：通过品类名称查询
                 cur.execute(
                     f"""
-                    SELECT factory_id, category_id,
+                    SELECT factory_id, category_name,
                            unit_price, price_1pct_vat, price_3pct_vat, price_13pct_vat,
                            price_normal_invoice, price_reverse_invoice
                     FROM quote_details
                     WHERE factory_id IN ({sm_ph})
-                      AND category_id IN ({ri_ph})
+                      AND category_name IN ({cn_ph})
                       AND quote_date = (
                           SELECT MAX(qd2.quote_date)
                           FROM quote_details qd2
                           WHERE qd2.factory_id = quote_details.factory_id
-                            AND qd2.category_id = quote_details.category_id
+                            AND qd2.category_name = quote_details.category_name
                       )
                     """,
-                    tuple(smelter_ids) + tuple(row_ids),
+                    tuple(smelter_ids) + tuple(all_cat_names),
                 )
                 col_names = ["unit_price", "price_1pct_vat", "price_3pct_vat",
                              "price_13pct_vat", "price_normal_invoice", "price_reverse_invoice"]
                 raw_price_map: Dict[tuple, Dict[str, Optional[float]]] = {}
                 for row in cur.fetchall():
-                    fid_r, rid = row[0], row[1]
-                    raw_price_map[(fid_r, rid)] = {
+                    fid_r, cat_name = row[0], row[1]
+                    raw_price_map[(fid_r, cat_name)] = {
                         col: (float(v) if v is not None else None)
                         for col, v in zip(col_names, row[2:])
                     }
@@ -974,26 +980,32 @@ class TLService:
             "price_13pct_vat": "13pct",
         }
 
-        def resolve_price(fid: int, rid: int) -> Optional[float]:
-            prices = raw_price_map.get((fid, rid), {})
-            rates = tax_rate_map.get(fid, {})
+        def resolve_price(fid: int, cat_id: int) -> Optional[float]:
+            # 找该 category_id 下的所有品类名称，取第一个有报价的
+            cat_names = cat_id_to_names.get(cat_id, [])
+            for cat_name in cat_names:
+                prices = raw_price_map.get((fid, cat_name), {})
+                if not prices:
+                    continue
 
-            # 1. 直接有目标列
-            direct = prices.get(target_col)
-            if direct is not None:
-                return direct
+                rates = tax_rate_map.get(fid, {})
 
-            # 2. 目标是含税价，且有不含税基础价 + 目标税率
-            if target_tax and prices.get("unit_price") is not None and target_tax in rates:
-                base = prices["unit_price"]
-                return round(base * (1 + rates[target_tax]), 2)
+                # 1. 直接有目标列
+                direct = prices.get(target_col)
+                if direct is not None:
+                    return direct
 
-            # 3. 目标是基础价，从已知含税价反算
-            if target_col == "unit_price":
-                for col, src_tax in COL_TO_TAX.items():
-                    known_price = prices.get(col)
-                    if known_price is not None and src_tax in rates:
-                        return round(known_price / (1 + rates[src_tax]), 2)
+                # 2. 目标是含税价，且有不含税基础价 + 目标税率
+                if target_tax and prices.get("unit_price") is not None and target_tax in rates:
+                    base = prices["unit_price"]
+                    return round(base * (1 + rates[target_tax]), 2)
+
+                # 3. 目标是基础价，从已知含税价反算
+                if target_col == "unit_price":
+                    for col, src_tax in COL_TO_TAX.items():
+                        known_price = prices.get(col)
+                        if known_price is not None and src_tax in rates:
+                            return round(known_price / (1 + rates[src_tax]), 2)
 
             # 4. 从其他已知含税价反算
             if target_tax and target_tax in rates:
@@ -1007,10 +1019,9 @@ class TLService:
 
         # 构建 price_map: {(factory_id, category_id): price}
         price_map: Dict[tuple, Optional[float]] = {}
-        for (fid, rid), _ in raw_price_map.items():
-            cid = row_id_to_cat.get(rid)
-            if cid:
-                price_map[(fid, cid)] = resolve_price(fid, rid)
+        for fid in smelter_ids:
+            for cid in category_ids:
+                price_map[(fid, cid)] = resolve_price(fid, cid)
 
         # 构造结构化数据：以需求为主体，报价统一（不含仓库），各仓库运费嵌套对比
         demand_rows = []

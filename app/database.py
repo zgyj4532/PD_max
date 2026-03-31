@@ -161,9 +161,8 @@ TABLE_STATEMENTS = [
         id INT AUTO_INCREMENT PRIMARY KEY,
         quote_date DATE NOT NULL COMMENT '报价日期',
         factory_id INT NOT NULL COMMENT '冶炼厂ID',
-        category_id INT NOT NULL COMMENT '品类行ID（关联dict_categories.row_id）',
+        category_name VARCHAR(100) NOT NULL COMMENT '品类名称（关联dict_categories.name）',
         metadata_id INT COMMENT '关联报价表元数据ID',
-        raw_category_name VARCHAR(100) COMMENT '原始品类名',
         unit_price DECIMAL(10, 2) COMMENT '普通单价（元/吨）',
         price_1pct_vat DECIMAL(10, 2) COMMENT '1%增值税价格',
         price_3pct_vat DECIMAL(10, 2) COMMENT '3%增值税价格',
@@ -173,11 +172,11 @@ TABLE_STATEMENTS = [
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         CONSTRAINT fk_detail_factory FOREIGN KEY (factory_id) REFERENCES dict_factories (id) ON UPDATE CASCADE ON DELETE RESTRICT,
-        CONSTRAINT fk_detail_category FOREIGN KEY (category_id) REFERENCES dict_categories (row_id) ON UPDATE CASCADE ON DELETE RESTRICT,
         CONSTRAINT fk_detail_metadata FOREIGN KEY (metadata_id) REFERENCES quote_table_metadata (id) ON UPDATE CASCADE ON DELETE SET NULL,
-        UNIQUE KEY uk_factory_category_date (factory_id, category_id, quote_date),
+        UNIQUE KEY uk_factory_category_date (factory_id, category_name, quote_date),
         INDEX idx_quote_date (quote_date),
-        INDEX idx_factory_id (factory_id)
+        INDEX idx_factory_id (factory_id),
+        INDEX idx_category_name (category_name)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='报价明细表';
     """,
     # 仓库库存表（预留）
